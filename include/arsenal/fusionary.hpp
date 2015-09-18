@@ -8,12 +8,12 @@
 //
 #pragma once
 
-#include <bitset>
+#include "arsenal/optional_field_specification.hpp"
+#include "arsenal/opaque_endian.h"
+
 #include <cstddef>
 #include <type_traits>
 #include <unordered_map>
-#define BOOST_OPTIONAL_NO_INPLACE_FACTORY_SUPPORT // hmm without this breaks using optional ctor
-#include <boost/optional.hpp>
 #include <boost/mpl/size.hpp>
 #include <boost/mpl/range_c.hpp>
 #include <boost/mpl/for_each.hpp>
@@ -101,42 +101,6 @@ constexpr unsigned int operator"" _bits_shift (unsigned long long bits)
     return bits;
 }
 
-// Variable size field or optional field flags
-template <typename T, size_t N = CHAR_BIT * sizeof(T)>
-struct field_flag
-{
-    using value_type = T;
-    using bits_type = std::bitset<N>;
-    value_type value;
-};
-
-// Type for Index type below
-template <int N>
-using field_index = boost::mpl::int_<N>;
-
-// Optional value
-template <typename Type, typename Index, size_t Num>
-struct optional_field_specification : boost::optional<Type>
-{
-    using boost::optional<Type>::optional; // @todo Requires BOOST_OPTIONAL_NO_INPLACE_FACTORY_SUPPORT
-    using index = Index;
-    constexpr static const size_t bit = Num;
-};
-
-// * a variable sized field, where size is controlled by external bitfield with certain mapping
-//   - where this bitfield is
-//   - offset of bits
-//   - mask of bits
-//   - mapping function (bits to type)
-template <typename Type, typename Index, size_t Mask, size_t Offset>
-struct varsize_field_specification
-{
-    Type value; // varsized_field_wrapper
-    using index = Index;
-    constexpr static const size_t bit_mask = Mask;
-    constexpr static const size_t bit_mask_offset = Offset;
-};
-
 struct nothing_t
 {
     template <typename T>
@@ -153,18 +117,11 @@ struct rest_t
     void operator = (std::string const& other) {
         data = other;
     }
-};
 
-// from above switcher struct we need to copy the appropriate field into output struct:
-template <typename SwitchType, typename FinalType>
-struct varsize_field_wrapper
-{
-    SwitchType choice_;
-    FinalType output_;
-
-    inline FinalType operator()(void) const { return output_; }
-    inline operator FinalType() const { return output_; }
-    inline FinalType value() const { return output_; }
+    bool operator==(rest_t const& o) const
+    {
+        return data == o.data;
+    }
 };
 
 template <class T>
@@ -231,6 +188,23 @@ struct reader
         buf_ = buf_ + sizeof(T);
     }
 
+    template <typename T, typename P = void>
+    auto operator()(T& val, P* = nullptr) const
+        -> typename std::enable_if<is_endian<T>::value>::type
+    {
+        // std::cout << "r(integral value)" << std::endl;
+        val = *boost::asio::buffer_cast<T const*>(buf_);
+        buf_ = buf_ + sizeof(T);
+    }
+
+    template <typename T, size_t N, typename P = void>
+    auto operator()(field_flag<T, N>& val, P* = nullptr) const
+        -> void
+    {
+        val.value = *boost::asio::buffer_cast<T const*>(buf_);
+        buf_ = buf_ + sizeof(T);
+    }
+
     // Read enums
 
     template <typename T, typename P = void>
@@ -282,7 +256,7 @@ struct reader
     // Read vector
 
     template <class T, typename P = void>
-    void operator()(std::vector<T>& vals, P* = nullptr)
+    void operator()(std::vector<T>& vals, P* = nullptr) const
     {
         // std::cout << "r(vector)" << std::endl;
         uint16_t length;
@@ -310,14 +284,6 @@ struct reader
             (*this)(val);
             kvs.emplace(key, val);
         }
-    }
-
-    // Read varsized fields flags
-
-    template <typename T, typename P = void>
-    void operator()(field_flag<T>& val, P* = nullptr) const {
-        // std::cout << "r(field flag)" << std::endl;
-        (*this)(val.value);
     }
 
     // Read varsized field
@@ -413,13 +379,12 @@ namespace fusionary {
 
 // @todo Return only remaining buf and pass T in by reference (we do anyway)?
 template <typename T>
-std::pair<T, boost::asio::const_buffer> read(T const&, boost::asio::const_buffer b)
+boost::asio::const_buffer read(T& val, boost::asio::const_buffer b)
 {
     reader r(std::move(b));
-    T res;
-    r(res);
+    r(val);
     // std::cout << "Remaining buffer space after read " << boost::asio::buffer_size(r.buf_) << " bytes" << std::endl;
-    return std::make_pair(res, r.buf_);
+    return r.buf_;
 }
 
 } // fusionary namespace
@@ -446,6 +411,22 @@ struct writer
         buf_ = buf_ + sizeof(T);
     }
 
+    template <typename T>
+    auto operator()(T const& val) const
+        -> typename std::enable_if<is_endian<T>::value>::type
+    {
+        boost::asio::buffer_copy(buf_, boost::asio::buffer(&val, sizeof(T)));
+        buf_ = buf_ + sizeof(T);
+    }
+
+    template <typename T, size_t N>
+    auto operator()(field_flag<T, N> const& val) const
+        -> void
+    {
+        boost::asio::buffer_copy(buf_, boost::asio::buffer(&val.value, sizeof(T)));
+        buf_ = buf_ + sizeof(T);
+    }
+
     // Write enums
 
     template <class T>
@@ -469,9 +450,9 @@ struct writer
 
     void operator()(std::string const& val) const
     {
-        (*this)(static_cast<uint16_t>(val.length()));
+        (*this)(static_cast<uint16_t>(val.size()));
         boost::asio::buffer_copy(buf_, boost::asio::buffer(val));
-        buf_ = buf_ + val.length();
+        buf_ = buf_ + val.size() + sizeof(uint16_t);
     }
 
     // Write vectors
@@ -479,7 +460,7 @@ struct writer
     template <class T>
     void operator()(std::vector<T> const& vals) const
     {
-        (*this)(static_cast<uint16_t>(vals.length()));
+        (*this)(static_cast<uint16_t>(vals.size()));
         for(auto&& val : vals)
             (*this)(val);
     }
@@ -489,7 +470,7 @@ struct writer
     template<class K, class V>
     void operator()(std::unordered_map<K, V> const& kvs) const
     {
-        (*this)(static_cast<uint16_t>(kvs.length()));
+        (*this)(static_cast<uint16_t>(kvs.size()));
         for(auto& kv : kvs) {
             (*this)(kv.first);
             (*this)(kv.second);
@@ -535,12 +516,33 @@ struct writer
             (*this)(val);
     }
 
+    template <typename Type, typename Index, size_t Mask, size_t Offset>
+    auto operator()(varsize_field_specification<Type,Index,Mask,Offset> const& val) const
+        -> void
+    {
+        (*this)(val.value);
+    }
+
+    template <typename T, typename V>
+    void operator()(varsize_field_wrapper<T,V> const& val) const
+    {
+        (*this)(val.output_);
+    }
+
+    template <typename Type, typename Index, size_t N>
+    auto operator()(optional_field_specification<Type,Index,N> const& val) const
+        -> void
+    {
+        if (val) {
+            (*this)(val.get());
+        }
+    }
     // Write the final remainder of the buffer
 
     void operator()(rest_t const& rest) const
     {
         boost::asio::buffer_copy(buf_, boost::asio::buffer(rest.data));
-        buf_ = buf_ + rest.data.length();
+        buf_ = buf_ + rest.data.size();
     }
 };
 
